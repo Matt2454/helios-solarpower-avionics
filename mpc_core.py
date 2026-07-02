@@ -67,6 +67,15 @@ VENT_EFFORT: dict[float, float] = {
 # Numerical tolerance below which a residual band violation counts as zero.
 _FEASIBLE_EPS: float = 1e-9
 
+# ── Certified Safety Buffer (cold-side robustness back-off) ─────────────
+# Default t_min_margin, applied unless the integrator overrides it. Validated by
+# the Monte-Carlo margin sweep (validation_montecarlo.py, Integration Manual §8):
+# at ±15% component tolerance + sensor/ambient noise, 1.5 K yields 0 breaches
+# across 10,000 randomised aircraft — 95% one-sided CI < 0.03% breach rate.
+# Applied BY DEFAULT ("safety by design"): a controller left unconfigured is
+# already robust, not merely nominal.
+DEFAULT_T_MIN_MARGIN: float = 1.5
+
 
 class TriggerReason(IntEnum):
     """
@@ -149,15 +158,19 @@ class ModelPredictiveController:
         into shadow instances during prediction rolls.
     t_min_margin : float
         Cold-side back-off [K]. Effective floor = T_MIN_SAFE + t_min_margin.
+        Defaults to the validated Certified Safety Buffer (DEFAULT_T_MIN_MARGIN
+        = 1.5 K) so the controller is robust even if left unconfigured.
     t_max_margin : float
         Hot-side back-off [K]. Effective ceiling = T_MAX_SAFE − t_max_margin.
+        Defaults to 0.0: the hot limit was non-binding across all validation
+        trials (>20 K margin), so no back-off is warranted by the data.
     """
 
     def __init__(
         self,
         weather_oracle: WeatherOracle,
         base_simulator: ThermalSimulator,
-        t_min_margin:   float = 0.0,
+        t_min_margin:   float = DEFAULT_T_MIN_MARGIN,
         t_max_margin:   float = 0.0,
     ):
         self.oracle   = weather_oracle
