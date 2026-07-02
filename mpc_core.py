@@ -128,6 +128,18 @@ class ModelPredictiveController:
     The real ThermalSimulator state is never modified during planning —
     only the shadow copy is mutated.
 
+    Robust MPC (constraint tightening)
+    ----------------------------------
+    The controller plans against a *tightened* thermal band
+        [T_MIN + t_min_margin,  T_MAX − t_max_margin]
+    rather than the raw certified limits. This back-off is what makes the
+    controller robust: because the predictor uses a NOMINAL plant model, model
+    mismatch and sensor error can push the TRUE battery colder/hotter than
+    predicted. Holding the *prediction* a margin inside the limits keeps the
+    *true* trajectory inside the certified [T_MIN, T_MAX] band. The required
+    margin (the "Certified Safety Buffer") is tuned empirically by the
+    Monte-Carlo harness — see validation_montecarlo.py.
+
     Parameters
     ----------
     weather_oracle : WeatherOracle
@@ -135,15 +147,28 @@ class ModelPredictiveController:
     base_simulator : ThermalSimulator
         The live simulator whose parameters (R, k, h, C) are copied
         into shadow instances during prediction rolls.
+    t_min_margin : float
+        Cold-side back-off [K]. Effective floor = T_MIN_SAFE + t_min_margin.
+    t_max_margin : float
+        Hot-side back-off [K]. Effective ceiling = T_MAX_SAFE − t_max_margin.
     """
 
     def __init__(
         self,
         weather_oracle: WeatherOracle,
         base_simulator: ThermalSimulator,
+        t_min_margin:   float = 0.0,
+        t_max_margin:   float = 0.0,
     ):
         self.oracle   = weather_oracle
         self.sim_live = base_simulator   # the "real" simulator — never mutated here
+
+        # Robustness back-off and the resulting effective (tightened) limits the
+        # controller actually enforces. Defaults of 0.0 reproduce nominal MPC.
+        self.t_min_margin = t_min_margin
+        self.t_max_margin = t_max_margin
+        self.t_min_eff    = T_MIN_SAFE + t_min_margin
+        self.t_max_eff    = T_MAX_SAFE - t_max_margin
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -212,10 +237,11 @@ class ModelPredictiveController:
 
             J = W_SAFETY · Σ band_violation(T_k)  +  W_EFFORT · effort(vent)
 
-        band_violation is the per-step distance OUTSIDE [T_MIN, T_MAX] (0 while
-        in-band), summed over the whole horizon — so a strategy is judged by
-        what it actually does to temperature across every predicted step, not
-        by a single-threshold check on a different trajectory.
+        band_violation is the per-step distance OUTSIDE the TIGHTENED band
+        [t_min_eff, t_max_eff] (0 while in-band), summed over the whole horizon.
+        Using the tightened band — not the raw certified limits — is what turns
+        this into a *robust* MPC: the controller is penalised for merely
+        approaching the limits, leaving a buffer to absorb model mismatch.
 
         Returns
         -------
@@ -225,10 +251,10 @@ class ModelPredictiveController:
         """
         total_violation = 0.0
         for t in temps:
-            if t < T_MIN_SAFE:
-                total_violation += (T_MIN_SAFE - t)
-            elif t > T_MAX_SAFE:
-                total_violation += (t - T_MAX_SAFE)
+            if t < self.t_min_eff:
+                total_violation += (self.t_min_eff - t)
+            elif t > self.t_max_eff:
+                total_violation += (t - self.t_max_eff)
 
         effort = VENT_EFFORT[vent_position]
         cost   = W_SAFETY * total_violation + W_EFFORT * effort
@@ -299,8 +325,8 @@ class ModelPredictiveController:
         # These indices explain *why* an action is taken (what would happen if
         # we held nominal cruise); the action itself is chosen by optimisation.
         cruise_temps = trajectories[VENT_CRUISE]
-        cold_risk = self._first_breach(cruise_temps, T_MIN_SAFE, above=False)
-        hot_risk  = self._first_breach(cruise_temps, T_MAX_SAFE, above=True)
+        cold_risk = self._first_breach(cruise_temps, self.t_min_eff, above=False)
+        hot_risk  = self._first_breach(cruise_temps, self.t_max_eff, above=True)
 
         # ── 3. Select the cost-minimising vent command ─────────────────────
         best_vent   = min(candidates, key=lambda v: costs[v])
@@ -318,16 +344,16 @@ class ModelPredictiveController:
         elif best_vent == VENT_CLOSED:
             code   = TriggerReason.PREEMPTIVE_CLOSE_COLD
             reason = (
-                f"PRE-EMPTIVE CLOSE — cruise would breach T_MIN "
-                f"({T_MIN_SAFE}°C) at step {cold_risk}; closing keeps the "
-                f"horizon in-band"
+                f"PRE-EMPTIVE CLOSE — cruise would cross the effective floor "
+                f"({self.t_min_eff:.1f}°C = T_MIN+{self.t_min_margin:.1f}) at "
+                f"step {cold_risk}; closing keeps the horizon in-band"
             )
         elif best_vent == VENT_OPEN:
             code   = TriggerReason.PREEMPTIVE_OPEN_HOT
             reason = (
-                f"PRE-EMPTIVE OPEN  — cruise would breach T_MAX "
-                f"({T_MAX_SAFE}°C) at step {hot_risk}; opening keeps the "
-                f"horizon in-band"
+                f"PRE-EMPTIVE OPEN  — cruise would cross the effective ceiling "
+                f"({self.t_max_eff:.1f}°C = T_MAX−{self.t_max_margin:.1f}) at "
+                f"step {hot_risk}; opening keeps the horizon in-band"
             )
         else:
             code   = TriggerReason.CRUISE_NOMINAL
