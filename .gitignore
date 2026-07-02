@@ -1,0 +1,10 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C++ build artifacts
+helios_fw
+*.o
+*.obj
+*.exe
