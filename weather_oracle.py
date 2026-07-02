@@ -10,8 +10,6 @@ real API data (Step 1.2b) or deterministic mock data for HIL testing.
 Physics model:
   T_ext(h)   = T_ground - (6.5 × h / 1000)     [ISA lapse rate, °C]
   V_wind(h)  = V_wind_ground + (1.5 × h / 1000) [linear wind shear, m/s]
-
-Author : Solar Plane Team (Architecture: Gemini | Lead Dev: Claude)
 """
 
 from dataclasses import dataclass

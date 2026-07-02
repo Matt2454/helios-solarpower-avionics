@@ -15,7 +15,7 @@ Physics model (dt = 60 s per tick):
   dT          = (P_total × dt) / C_thermal
   T_int_new   = T_int + dT
 
-Author : Solar Plane Team (Architecture: Gemini | Lead Dev: Claude)
+
 """
 
 

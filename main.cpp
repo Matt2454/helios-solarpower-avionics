@@ -66,25 +66,97 @@ struct SensorFrame {
 /**
  * @brief PID controller state — one instance per axis / loop.
  *        Integration and derivative terms persist across ticks.
+ *
+ * Hardened over a textbook PID with two fixes that matter the moment this
+ * leaves the benign simulation and meets a real actuator:
+ *
+ *   1. Derivative on MEASUREMENT (not error) — removes "derivative kick".
+ *   2. Conditional integration + integral clamp — removes integral windup.
+ *
+ * See compute() for the derivation of each.
  */
 struct PidState {
+    // Gains. Kept as the first three members so existing designated-
+    // initializer construction { .kp=…, .ki=…, .kd=… } remains valid.
     float kp = 0.0f, ki = 0.0f, kd = 0.0f;
-    float integral   = 0.0f;
-    float prev_error = 0.0f;
-    float output     = 0.0f;
+
+    // ── Output saturation limits (actuator authority, in PID output units) ──
+    // The controller MUST know where its own output saturates; otherwise the
+    // integrator keeps winding while the actuator is already hard against its
+    // stop. Downstream, elevator/aileron demand = output × 0.1, so ±10 here
+    // corresponds to the ±1.0 normalised control-surface travel limit.
+    float out_min = -10.0f, out_max = 10.0f;
+
+    // ── Persistent state ────────────────────────────────────────────────
+    float integral      = 0.0f;
+    float prev_measured = 0.0f;   // for derivative-on-measurement
+    float output        = 0.0f;
+    bool  initialised   = false;  // seeds prev_measured on the first call
 
     /**
-     * @brief Compute one PID step.
+     * @brief Compute one PID step (anti-windup + derivative-on-measurement).
      * @param setpoint  Desired value
      * @param measured  Current measured value
      * @param dt        Time step [s]
+     *
+     * FIX 1 — Derivative on measurement, not error.
+     *   d_term = -kd · (measured − prev_measured) / dt        (note the sign)
+     *   A textbook D term differentiates the ERROR, so a step change in the
+     *   SETPOINT — e.g. the pitch target stepping 4°→1.5°→−3° at the flight-
+     *   phase boundaries — injects a one-tick impulse (the "derivative kick")
+     *   that slams the servo. Differentiating the measurement instead makes
+     *   the D term blind to setpoint steps while still damping real motion.
+     *   (Mid-phase, with a constant setpoint, this is algebraically identical
+     *   to the old form, so nominal behaviour is unchanged.)
+     *
+     * FIX 2 — Anti-windup (conditional integration + hard clamp).
+     *   While the output is saturated (servo pinned), a naive integrator keeps
+     *   accumulating and must later "unwind", producing a large overshoot on
+     *   recovery. Here the integrator is (a) hard-clamped so its term ki·I can
+     *   never exceed the output range on its own, and (b) frozen whenever the
+     *   output is saturated AND the error would drive it further into the rail.
      */
     void compute(float setpoint, float measured, float dt) {
-        const float error  = setpoint - measured;
-        integral          += error * dt;
-        const float deriv  = (error - prev_error) / dt;
-        output             = kp * error + ki * integral + kd * deriv;
-        prev_error         = error;
+        const float error = setpoint - measured;
+
+        // Seed derivative memory on first call to avoid a spurious kick from
+        // prev_measured == 0.
+        if (!initialised) { prev_measured = measured; initialised = true; }
+
+        // ── FIX 1: derivative on measurement ───────────────────────────
+        const float d_term = -kd * (measured - prev_measured) / dt;
+        prev_measured = measured;
+
+        // ── Trial integral, hard-clamped so ki·I stays within output range ─
+        float integral_trial = integral + error * dt;
+        if (ki > 0.0f) {
+            const float i_max = out_max / ki;
+            const float i_min = out_min / ki;
+            if (integral_trial > i_max) integral_trial = i_max;
+            if (integral_trial < i_min) integral_trial = i_min;
+        }
+
+        // ── Unsaturated output with the trial integral ─────────────────
+        const float u = kp * error + ki * integral_trial + d_term;
+
+        // ── Saturate to actuator authority ─────────────────────────────
+        float u_sat = u;
+        if (u_sat > out_max) u_sat = out_max;
+        if (u_sat < out_min) u_sat = out_min;
+
+        // ── FIX 2: conditional integration ─────────────────────────────
+        // Commit the trial integral only when NOT winding deeper into a
+        // saturated rail. If the output is pinned high and the error is still
+        // positive (or pinned low with negative error), freeze the integrator;
+        // otherwise accept it (integration is helping the output recover).
+        const bool winding_up   = (u > out_max) && (error > 0.0f);
+        const bool winding_down = (u < out_min) && (error < 0.0f);
+        if (!winding_up && !winding_down) {
+            integral = integral_trial;
+        }
+        // else: hold `integral` at its previous value this tick.
+
+        output = u_sat;
     }
 };
 
@@ -103,15 +175,32 @@ struct ActuatorDemand {
  * @brief Telemetry snapshot reported at 1 Hz to the ground link / console.
  */
 struct TelemetryFrame {
-    uint32_t tick        = 0;
-    float    loop_time_us= 0.0f;   // actual loop execution time
-    float    jitter_us   = 0.0f;   // deviation from target period
+    uint32_t tick             = 0;
+
+    // ── Real-time timing metrics ───────────────────────────────────────
+    // Three DISTINCT quantities, deliberately not merged, because each
+    // answers a different question about loop health:
+    //
+    //   compute_us       (c_k)             — "did the work fit the budget?"
+    //   slip_us          (Φ_k = s_k − d_k) — "did the tick land on the grid?"
+    //   period_jitter_us (Φ_k − Φ_{k−1})   — "was the effective Δt uniform?"
+    //
+    // Only the latter two carry control-stability meaning:
+    //   • slip_us          is dead time  → phase-margin loss
+    //   • period_jitter_us is Δt error   → distorts the PID I/D discretisation
+    // compute_us is mere headroom and must NEVER gate stability.
+    float    compute_us       = 0.0f;   // c_k             — execution time only
+    float    slip_us          = 0.0f;   // Φ_k = s_k − d_k — schedule slip vs grid
+    float    period_jitter_us = 0.0f;   // Φ_k − Φ_{k−1}   — first difference of slip
+    uint32_t missed_deadlines = 0;      // cumulative periods shed by recovery logic
+
+    // ── Flight state snapshot ──────────────────────────────────────────
     float    altitude_m  = 0.0f;
     float    airspeed_ms = 0.0f;
     float    pitch_deg   = 0.0f;
     float    hatch_pos   = 0.0f;   // 0.0 closed → 1.0 fully open
     float    throttle    = 0.0f;
-    bool     jitter_warn = false;
+    bool     jitter_warn = false;  // set on real timing error (slip / missed), not headroom
 };
 
 
@@ -313,7 +402,8 @@ static void emitTelemetry() {
     std::printf(
         "  [%5.1fs | %s | tick %05u]  "
         "Alt: %7.1f m  |  IAS: %5.2f m/s  |  Pitch: %+6.2f°  |  "
-        "Hatch: %.1f  |  Thr: %4.1f%%  |  Loop: %6.1fµs  |  Jitter: %+6.1fµs%s\n",
+        "Hatch: %.1f  |  Thr: %4.1f%%  |  "
+        "Comp: %5.1fµs  |  Slip: %+6.1fµs  |  PJit: %+6.1fµs  |  Miss: %u%s\n",
         g_mission_time_s,
         phase,
         g_telemetry.tick,
@@ -322,8 +412,10 @@ static void emitTelemetry() {
         g_telemetry.pitch_deg,
         g_telemetry.hatch_pos,
         g_telemetry.throttle * 100.0f,
-        g_telemetry.loop_time_us,
-        g_telemetry.jitter_us,
+        g_telemetry.compute_us,
+        g_telemetry.slip_us,
+        g_telemetry.period_jitter_us,
+        g_telemetry.missed_deadlines,
         jitter_flag
     );
 }
@@ -345,44 +437,89 @@ int main() {
     std::printf("  Mission duration   : %.0f s\n\n", MISSION_DURATION_S);
     std::printf("  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────\n");
 
-    uint32_t tick          = 0;
-    float    loop_time_us  = 0.0f;
+    uint32_t tick = 0;
 
-    // Deadline scheduler: track when each tick SHOULD have started
-    TimePoint loop_start   = Clock::now();
-    TimePoint tick_deadline = loop_start;
+    // ── Deadline scheduler state ───────────────────────────────────────
+    // The loop is anchored to a FIXED time grid:  d_k = d_0 + k·T,
+    // where T = LOOP_PERIOD_US. `tick_deadline` always holds d_k — the
+    // instant at which tick k SHOULD begin. Timing error is recovered by
+    // comparing the ACTUAL start s_k against d_k, NOT by measuring how long
+    // the work took (compute time is blind to the grid — see below).
+    TimePoint tick_deadline = Clock::now();   // d_0 — ideal start of tick 0
+    float     prev_slip_us  = 0.0f;           // Φ_{k−1} — kept for the first difference
 
     while (g_mission_time_s <= MISSION_DURATION_S) {
 
+        // ── Timing capture: schedule slip  Φ_k = s_k − d_k ─────────────
+        // s_k = actual start of this tick;  d_k = tick_deadline.
+        // Φ_k is the loop's PHASE ERROR against the ideal grid — i.e. the
+        // dead time injected into the control law this cycle. Φ_k > 0 means
+        // the tick fired late (a transport delay → phase-margin loss);
+        // Φ_k ≈ 0 is healthy. This is the metric that governs stability,
+        // and it is captured BEFORE the pipeline runs.
         const TimePoint tick_start = Clock::now();
+        const float slip_us = static_cast<float>(
+            std::chrono::duration_cast<Micros>(tick_start - tick_deadline).count()
+        );
+
+        // ── Period jitter = Φ_k − Φ_{k−1}  (first difference of the slip) ─
+        // The effective sample interval is  Δ_k = s_k − s_{k−1}
+        //                                       = T + (Φ_k − Φ_{k−1}).
+        // So this first difference IS the error in Δt that the PID silently
+        // absorbs: it multiplies the integral term (err·Δt) and divides the
+        // derivative term (Δerr/Δt), both of which are coded assuming Δ_k = T.
+        const float period_jitter_us = slip_us - prev_slip_us;
+        prev_slip_us = slip_us;
 
         // ── Pipeline ───────────────────────────────────────────────────
         readSensors();
         processControlLaws();
         outputActuators();
 
-        // ── Measure actual execution time ──────────────────────────────
-        const TimePoint tick_end   = Clock::now();
-        loop_time_us = static_cast<float>(
+        // ── Compute time  c_k  (budget headroom — NOT a timing error) ──
+        // Retained only to answer "did the work fit inside the 10 ms slot?"
+        // It contains no phase information; the OLD jitter metric was exactly
+        // this value minus T, which is why it read a near-constant −9995 µs
+        // and tripped the warning on every tick.
+        const TimePoint tick_end = Clock::now();
+        const float compute_us = static_cast<float>(
             std::chrono::duration_cast<Micros>(tick_end - tick_start).count()
         );
 
-        // ── Populate telemetry struct ──────────────────────────────────
-        const float actual_us = static_cast<float>(
-            std::chrono::duration_cast<Micros>(tick_end - tick_start).count()
-        );
-        const float jitter_us = actual_us - static_cast<float>(LOOP_PERIOD_US);
+        // ── Advance to the next grid deadline:  d_{k+1} = d_k + T ───────
         tick_deadline += Micros(LOOP_PERIOD_US);
 
-        g_telemetry.tick         = tick;
-        g_telemetry.loop_time_us = loop_time_us;
-        g_telemetry.jitter_us    = jitter_us;
-        g_telemetry.altitude_m   = g_sensors.altitude_m;
-        g_telemetry.airspeed_ms  = g_sensors.airspeed_ms;
-        g_telemetry.pitch_deg    = g_sensors.pitch_deg;
-        g_telemetry.hatch_pos    = g_actuators.hatch_norm;
-        g_telemetry.throttle     = g_actuators.throttle_norm;
-        g_telemetry.jitter_warn  = std::abs(jitter_us) > static_cast<float>(JITTER_WARN_US);
+        // ── Deadline-miss recovery (backlog shedding) ──────────────────
+        // If we overran so badly that d_{k+1} is ALREADY in the past,
+        // sleep_until() would return instantly and the loop would fire a
+        // burst of catch-up ticks with Δ_k ≪ T — collapsing the effective
+        // sample interval and spiking the derivative term (Δerr/Δt → ∞).
+        // Instead we SNAP FORWARD by whole periods until the deadline is
+        // once again in the future. Snapping by integer T preserves phase
+        // alignment to the original grid (we drop a slot rather than reset
+        // it); the discarded cycles are counted so the loss stays visible.
+        uint32_t missed = 0;
+        while (tick_deadline < tick_end) {
+            tick_deadline += Micros(LOOP_PERIOD_US);
+            ++missed;
+        }
+
+        // ── Populate telemetry struct ──────────────────────────────────
+        g_telemetry.tick             = tick;
+        g_telemetry.compute_us       = compute_us;
+        g_telemetry.slip_us          = slip_us;
+        g_telemetry.period_jitter_us = period_jitter_us;
+        g_telemetry.missed_deadlines += missed;          // cumulative over the mission
+        g_telemetry.altitude_m       = g_sensors.altitude_m;
+        g_telemetry.airspeed_ms      = g_sensors.airspeed_ms;
+        g_telemetry.pitch_deg        = g_sensors.pitch_deg;
+        g_telemetry.hatch_pos        = g_actuators.hatch_norm;
+        g_telemetry.throttle         = g_actuators.throttle_norm;
+
+        // Warn on REAL timing error: excessive phase slip OR a dropped
+        // deadline this cycle — never on spare compute headroom.
+        g_telemetry.jitter_warn =
+            (std::abs(slip_us) > static_cast<float>(JITTER_WARN_US)) || (missed > 0);
 
         // ── 1 Hz telemetry heartbeat ───────────────────────────────────
         if (tick % TELEMETRY_INTERVAL == 0) {
@@ -390,19 +527,31 @@ int main() {
         }
 
         // ── Deterministic non-blocking wait ───────────────────────────
-        // Sleep until the next scheduled deadline. std::this_thread::sleep_until
-        // uses the OS scheduler; residual error is measured as jitter above.
-        // On bare metal this is replaced by SysTick IRQ or TIM6 overflow.
+        // Sleep until the next grid deadline. On the host this defers to the
+        // OS scheduler, so residual error resurfaces as slip_us on the NEXT
+        // cycle. On bare metal this is replaced by a SysTick IRQ or TIM6
+        // overflow, where slip collapses to hardware-timer precision.
         std::this_thread::sleep_until(tick_deadline);
 
         // ── Advance clocks ─────────────────────────────────────────────
-        g_mission_time_s += 1.0f / static_cast<float>(LOOP_RATE_HZ);
+        // Wall time advanced by (1 + missed) periods: the tick just run plus
+        // any deliberately shed. Keeping the sim clock aligned to real
+        // elapsed time matters once a hardware RTC drives the flight profile.
+        g_mission_time_s += static_cast<float>(1 + missed) / static_cast<float>(LOOP_RATE_HZ);
         ++tick;
     }
 
     // ── End-of-mission report ──────────────────────────────────────────
     std::printf("  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────\n");
     std::printf("\n  Mission complete. %u ticks executed at target %u Hz.\n", tick, LOOP_RATE_HZ);
+
+    // Real-time integrity summary. missed_deadlines is the count of grid slots
+    // shed by the snap-forward recovery — the headline figure for whether the
+    // loop held hard real-time. On healthy host runs this must read 0.
+    std::printf("  Real-time integrity : %u deadline(s) missed / shed  (%s)\n",
+                g_telemetry.missed_deadlines,
+                (g_telemetry.missed_deadlines == 0) ? "HARD REAL-TIME HELD"
+                                                    : "DEADLINES SHED — INVESTIGATE");
     std::printf("  Helios Avionics Firmware Core v2.0 — halted.\n\n");
 
     return 0;
