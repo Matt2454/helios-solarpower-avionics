@@ -3,41 +3,44 @@
 #
 # PROPRIETARY AND CONFIDENTIAL — Core Component of the Helios Avionics
 # Middleware (see LICENSING.md). Licensed, not sold, under LICENSE-CORE.
-# Robustness / model-mismatch validation harness for the thermal MPC core.
+# Model-mismatch / robustness validation harness for the thermal MPC core.
 """
-Helios UAV Avionics — Monte-Carlo Robustness Harness
-=====================================================
-Closes the "perfect-model fallacy": the standard flight_loop_sim validates the
-MPC by letting it predict with a shadow copy of the EXACT plant it controls, so
-success is guaranteed by construction. That proves the control *logic*, not
-robustness.
+Helios UAV Avionics — Monte-Carlo Model-Mismatch Validation ("Sim Flight Test")
+================================================================================
+Closes the "perfect-model fallacy": flight_loop_sim lets the MPC predict with a
+shadow copy of the EXACT plant it controls, so success is guaranteed by
+construction. That proves control *logic*, not robustness.
 
 This harness breaks the symmetry that matters for a real product:
 
-    ┌─────────────────────────┐        noisy measured T_bat
+    ┌─────────────────────────┐        NOISY measured T_bat
     │  MPC predictor          │◄───────────────────────────────┐
     │  (NOMINAL parameters)   │                                 │
     └───────────┬─────────────┘                                 │
                 │ vent command                                  │
                 ▼                                                │
-    ┌─────────────────────────┐   true (hidden) T_bat           │
+    ┌─────────────────────────┐   TRUE (hidden) T_bat           │
     │  TRUE plant             │─────────────────────────────────┘
     │  (PERTURBED parameters, │
     │   +ambient disturbance) │
     └─────────────────────────┘
 
-Per Monte-Carlo trial we perturb the plant the MPC does NOT know about:
-  * battery internal resistance R_internal   (±10% — the user's example)
-  * insulation conductance      k_insulation (±10%)
-  * vent effectiveness          h_air        (±10%)
-  * thermal capacity            C_thermal    (±10%)
-  * initial battery temperature (Gaussian offset)
-and corrupt what the MPC can see / faces:
-  * sensor noise on the measured battery temperature (Gaussian)
-  * an unmodelled ambient-temperature disturbance the weather oracle missed
+Injected uncertainty (all invisible to the MPC):
+  * R_internal / k_insulation / h_air / C_thermal  ±15% (uniform)
+  * Gaussian battery-temp SENSOR noise (drift/jitter)
+  * Gaussian initial-temperature spread
+  * Unmodelled ambient-temperature disturbance the weather oracle missed
 
-We then ask the only question that matters commercially: across many randomised
-aircraft, does Helios keep the TRUE battery inside [T_MIN, T_MAX]?
+The pass question is NOT merely "zero breaches". A safety-critical controller is
+acceptable if it EITHER holds the band OR flags that it cannot. So every trial
+is classified into one of three outcomes:
+
+  SAFE    — no breach.
+  WARNED  — a breach occurred, but the MPC raised BEST_EFFORT_INFEASIBLE at or
+            before the breach: it KNEW it could not hold and said so. Honest
+            degradation — the aircraft can escalate (shed load, abort).
+  SILENT  — a breach occurred with NO prior infeasible signal. The controller
+            believed it was safe and was wrong. THIS is the disqualifying case.
 
 Run:
     PYTHONUTF8=1 python validation_montecarlo.py
@@ -51,6 +54,7 @@ from thermal_simulator import ThermalSimulator
 from weather_oracle    import WeatherOracle
 from mpc_core          import (
     ModelPredictiveController,
+    TriggerReason,
     T_MIN_SAFE, T_MAX_SAFE,
 )
 from flight_loop_sim   import generate_mission_profile, MPC_HORIZON
@@ -74,10 +78,10 @@ class MismatchConfig:
 
     # Fractional tolerance (± uniform) applied to each true plant parameter.
     param_tol: dict = field(default_factory=lambda: {
-        "R_internal":   0.10,   # battery resistance varies by ±10%
-        "k_insulation": 0.10,
-        "h_air":        0.10,
-        "C_thermal":    0.10,
+        "R_internal":   0.15,   # battery resistance varies by ±15%
+        "k_insulation": 0.15,
+        "h_air":        0.15,
+        "C_thermal":    0.15,
     })
 
     init_temp_sigma:  float = 1.5   # °C — spread of true take-off temperature
@@ -87,14 +91,37 @@ class MismatchConfig:
 
 @dataclass
 class TrialResult:
-    min_t_bat:     float
-    max_t_bat:     float
-    cold_breaches: int
-    hot_breaches:  int
+    realized_min_t:  float          # coldest TRUE battery temp reached
+    realized_max_t:  float          # hottest TRUE battery temp reached
+    predicted_min_t: float          # MPC's most-pessimistic in-horizon belief
+    cold_breaches:   int
+    hot_breaches:    int
+    breach_step:     int | None     # first minute a breach occurred (0-based)
+    infeasible_step: int | None     # first minute MPC raised INFEASIBLE
+
+    # ── Derived classification ─────────────────────────────────────────
+    @property
+    def breached(self) -> bool:
+        return self.cold_breaches > 0 or self.hot_breaches > 0
 
     @property
-    def safe(self) -> bool:
-        return self.cold_breaches == 0 and self.hot_breaches == 0
+    def outcome(self) -> str:
+        if not self.breached:
+            return "SAFE"
+        warned = (
+            self.infeasible_step is not None
+            and self.breach_step is not None
+            and self.infeasible_step <= self.breach_step
+        )
+        return "WARNED" if warned else "SILENT"
+
+    @property
+    def realized_margin(self) -> float:
+        return self.realized_min_t - T_MIN_SAFE
+
+    @property
+    def predicted_margin(self) -> float:
+        return self.predicted_min_t - T_MIN_SAFE
 
 
 def _sample_true_params(rng: random.Random, cfg: MismatchConfig) -> dict:
@@ -109,7 +136,7 @@ def run_trial(rng: random.Random, cfg: MismatchConfig, mission) -> TrialResult:
     """
     Simulate one randomised aircraft over the full mission.
 
-    Key invariant: the MPC plans with NOMINAL parameters and a NOISY measured
+    Invariant: the MPC plans with NOMINAL parameters and a NOISY measured
     temperature; the TRUE plant evolves with perturbed parameters and an
     ambient disturbance. The two never share state.
     """
@@ -128,8 +155,10 @@ def run_trial(rng: random.Random, cfg: MismatchConfig, mission) -> TrialResult:
     # Per-trial unmodelled ambient bias (weather the oracle failed to predict).
     ambient_bias = rng.gauss(0.0, cfg.ambient_sigma)
 
-    min_t = max_t = true_sim.T_internal
+    realized_min = realized_max = true_sim.T_internal
+    predicted_min = float("inf")
     cold = hot = 0
+    breach_step = infeasible_step = None
 
     for i, fm in enumerate(mission):
         # Rolling MPC look-ahead (next MPC_HORIZON waypoints), padded at the end.
@@ -147,6 +176,15 @@ def run_trial(rng: random.Random, cfg: MismatchConfig, mission) -> TrialResult:
             current_current_solar  = fm.current_solar_a,
         )
 
+        # Predictive margin: the MPC's most-pessimistic belief along the horizon
+        # it CHOSE. This is what Helios "thinks" the margin is.
+        predicted_min = min(predicted_min, min(decision.horizon_temps))
+
+        # Record the first moment Helios admits it cannot hold the band.
+        if (decision.trigger_code == TriggerReason.BEST_EFFORT_INFEASIBLE
+                and infeasible_step is None):
+            infeasible_step = i
+
         # Advance the TRUE plant: real atmosphere + unmodelled bias, perturbed
         # physics, and the vent command the MPC actually issued.
         atm = oracle.get_state_at_altitude(fm.altitude_m)
@@ -159,26 +197,44 @@ def run_trial(rng: random.Random, cfg: MismatchConfig, mission) -> TrialResult:
         )
 
         t = true_sim.T_internal
-        min_t = min(min_t, t)
-        max_t = max(max_t, t)
+        realized_min = min(realized_min, t)
+        realized_max = max(realized_max, t)
         if t < T_MIN_SAFE:
             cold += 1
+            if breach_step is None:
+                breach_step = i
         if t > T_MAX_SAFE:
             hot += 1
+            if breach_step is None:
+                breach_step = i
 
-    return TrialResult(min_t, max_t, cold, hot)
+    return TrialResult(
+        realized_min_t  = realized_min,
+        realized_max_t  = realized_max,
+        predicted_min_t = predicted_min,
+        cold_breaches   = cold,
+        hot_breaches    = hot,
+        breach_step     = breach_step,
+        infeasible_step = infeasible_step,
+    )
+
+
+def _pctile(sorted_vals: list[float], q: float) -> float:
+    """Simple lower-bound percentile on a pre-sorted list."""
+    idx = max(0, int(q * len(sorted_vals)) - 1)
+    return sorted_vals[idx]
 
 
 def run_campaign(cfg: MismatchConfig) -> None:
     rng     = random.Random(cfg.seed)
     mission = generate_mission_profile()
 
-    DIV = "─" * 74
+    DIV = "─" * 76
     print()
-    print("  Helios UAV Avionics — Monte-Carlo Robustness Harness")
-    print("  Model-Mismatch Validation · Cold-Wave Stress Scenario")
+    print("  Helios UAV Avionics — Model-Mismatch Validation (Sim Flight Test)")
+    print("  Cold-Wave Stress Scenario · MPC predicts NOMINAL, plant runs PERTURBED")
     print(DIV)
-    print(f"  Trials              : {cfg.n_trials}")
+    print(f"  Trials              : {cfg.n_trials}   (seed {cfg.seed})")
     print(f"  Parameter tolerance : " +
           ", ".join(f"{k} ±{int(v*100)}%" for k, v in cfg.param_tol.items()))
     print(f"  Sensor noise (1σ)   : {cfg.sensor_sigma:.2f} °C")
@@ -188,34 +244,57 @@ def run_campaign(cfg: MismatchConfig) -> None:
     print(DIV)
 
     results = [run_trial(rng, cfg, mission) for _ in range(cfg.n_trials)]
+    n = len(results)
 
-    safe        = sum(r.safe for r in results)
-    cold_fail   = sum(r.cold_breaches > 0 for r in results)
-    hot_fail    = sum(r.hot_breaches  > 0 for r in results)
-    min_temps   = sorted(r.min_t_bat for r in results)
-    worst_min   = min_temps[0]
-    p05_min     = min_temps[max(0, int(0.05 * len(min_temps)) - 1)]
-    median_min  = statistics.median(min_temps)
+    safe   = [r for r in results if r.outcome == "SAFE"]
+    warned = [r for r in results if r.outcome == "WARNED"]
+    silent = [r for r in results if r.outcome == "SILENT"]
 
-    breach_rate = 100.0 * (cfg.n_trials - safe) / cfg.n_trials
-
-    print(f"  Safe trials (0 breaches) : {safe} / {cfg.n_trials}  "
-          f"({100.0*safe/cfg.n_trials:.1f}%)")
-    print(f"  Trials with COLD breach  : {cold_fail}")
-    print(f"  Trials with HOT  breach  : {hot_fail}")
-    print(DIV)
-    print(f"  Min T_bat — worst trial  : {worst_min:+.2f} °C  "
-          f"(margin vs T_MIN: {worst_min - T_MIN_SAFE:+.2f} K)")
-    print(f"  Min T_bat —  5th pctile  : {p05_min:+.2f} °C  "
-          f"(margin vs T_MIN: {p05_min - T_MIN_SAFE:+.2f} K)")
-    print(f"  Min T_bat —  median      : {median_min:+.2f} °C")
+    # ── Outcome triage ─────────────────────────────────────────────────
+    print("  OUTCOME TRIAGE")
+    print(f"    SAFE   (no breach)                 : {len(safe):4d}  "
+          f"({100.0*len(safe)/n:5.1f}%)")
+    print(f"    WARNED (breach, flagged infeasible): {len(warned):4d}  "
+          f"({100.0*len(warned)/n:5.1f}%)")
+    print(f"    SILENT (breach, NO warning)        : {len(silent):4d}  "
+          f"({100.0*len(silent)/n:5.1f}%)   <-- disqualifying")
     print(DIV)
 
-    if breach_rate == 0.0:
-        verdict = "PASS — 0% breach rate under model mismatch (robust)"
+    # ── Predictive margin: belief vs reality ───────────────────────────
+    realized = sorted(r.realized_margin for r in results)
+    predicted = sorted(r.predicted_margin for r in results)
+    gaps      = [r.predicted_margin - r.realized_margin for r in results]
+
+    print("  PREDICTIVE MARGIN vs T_MIN  (K above the 10 °C floor)")
+    print(f"    Realized  — worst   : {realized[0]:+.2f} K")
+    print(f"    Realized  —  5th pct: {_pctile(realized, 0.05):+.2f} K")
+    print(f"    Realized  — median  : {statistics.median(realized):+.2f} K")
+    print(f"    Predicted — median  : {statistics.median(predicted):+.2f} K "
+          f"(what Helios believed)")
+    print(f"    Optimism gap median : {statistics.median(gaps):+.2f} K "
+          f"(belief − reality; >0 = over-confident)")
+    print(DIV)
+
+    # ── Infeasibility situational awareness ────────────────────────────
+    ever_infeasible = sum(r.infeasible_step is not None for r in results)
+    print("  SELF-AWARENESS")
+    print(f"    Trials that ever raised INFEASIBLE : {ever_infeasible} / {n}")
+    if silent:
+        worst = min(silent, key=lambda r: r.realized_min_t)
+        print(f"    Worst SILENT breach                : "
+              f"{worst.realized_min_t:+.2f} °C true "
+              f"(believed {worst.predicted_min_t:+.2f} °C)")
+    print(DIV)
+
+    # ── Verdict ────────────────────────────────────────────────────────
+    if not warned and not silent:
+        verdict = "PASS — 0 breaches across all trials (robust to ±tolerances)"
+    elif not silent:
+        verdict = ("CONDITIONAL — breaches occurred but ALL were flagged "
+                   "infeasible in advance (honest degradation, not silent)")
     else:
-        verdict = (f"FAIL — {breach_rate:.1f}% of trials breach the safe band "
-                   f"under expected tolerances")
+        verdict = (f"FAIL — {len(silent)} SILENT breach(es) "
+                   f"({100.0*len(silent)/n:.1f}%): Helios was confident and wrong")
     print(f"  VERDICT: {verdict}")
     print()
 
