@@ -1,0 +1,58 @@
+HELIOS AVIONICS MIDDLEWARE — CORE COMPONENTS
+PROPRIETARY COMMERCIAL LICENSE
+
+>>> DRAFT / PLACEHOLDER — NOT YET LEGALLY BINDING <<<
+>>> TODO: Replace this document with final terms reviewed by IP counsel <<<
+>>> TODO: Replace "Helios Avionics" with the registered legal entity name <<<
+
+Copyright (c) 2026 Helios Avionics. All rights reserved.
+
+-------------------------------------------------------------------------------
+1. SCOPE
+-------------------------------------------------------------------------------
+This license governs the "Core Components" of the Helios Avionics Middleware —
+the files identified as proprietary in LICENSING.md, which include the Model
+Predictive Control (MPC) engine, the safety state machine, and the reference
+thermal plant model. The Core Components are LICENSED, NOT SOLD.
+
+The "Open Components" of this repository are licensed separately and
+permissively under the Apache License, Version 2.0 (see LICENSE). Nothing in
+this document restricts rights granted under that license for the Open
+Components.
+
+-------------------------------------------------------------------------------
+2. GRANT (subject to a separate executed commercial agreement)
+-------------------------------------------------------------------------------
+Subject to a fully executed written commercial agreement between Helios
+Avionics ("Licensor") and the licensee ("You"), and to Your compliance with
+its terms, Licensor grants You a non-exclusive, non-transferable, revocable
+license to integrate the Core Components, in Object (compiled) form only, into
+Your products as permitted by that agreement.
+
+Absent such an executed agreement, NO rights are granted, and any use,
+reproduction, or distribution of the Core Components is prohibited.
+
+-------------------------------------------------------------------------------
+3. RESTRICTIONS
+-------------------------------------------------------------------------------
+Except as expressly permitted by an executed commercial agreement, You may NOT:
+  (a) access, distribute, or sublicense the Source form of the Core Components;
+  (b) reverse engineer, decompile, or disassemble the Core Components, except
+      to the extent such restriction is prohibited by applicable law;
+  (c) remove or alter any proprietary notices or SPDX identifiers;
+  (d) use the Core Components to develop a competing product.
+
+-------------------------------------------------------------------------------
+4. NO WARRANTY / LIMITATION OF LIABILITY
+-------------------------------------------------------------------------------
+THE CORE COMPONENTS ARE PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. THEY ARE
+NOT CERTIFIED FOR AIRWORTHINESS AND ARE PROVIDED FOR INTEGRATION AS AN ADVISORY
+SUBSYSTEM ONLY. The integrator retains sole responsibility for the safety and
+certification of any system into which the Core Components are integrated. To
+the maximum extent permitted by law, Licensor shall not be liable for any
+damages arising from use of the Core Components.
+
+-------------------------------------------------------------------------------
+5. CONTACT
+-------------------------------------------------------------------------------
+For commercial licensing, contact: <licensing@helios-avionics.example>

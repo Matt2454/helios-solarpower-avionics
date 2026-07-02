@@ -1,3 +1,10 @@
+# SPDX-FileCopyrightText: 2026 Helios Avionics. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-Helios-Commercial
+#
+# PROPRIETARY AND CONFIDENTIAL — Core Component of the Helios Avionics
+# Middleware (see LICENSING.md). Licensed, not sold, under LICENSE-CORE.
+# Source redistribution is prohibited; shipped to integrators in compiled
+# form only. Contains the pre-emptive thermal-vent MPC algorithm.
 """
 Helios UAV Avionics — Model Predictive Controller
 ===================================================

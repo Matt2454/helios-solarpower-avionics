@@ -1,3 +1,9 @@
+// SPDX-FileCopyrightText: 2026 Helios Avionics
+// SPDX-License-Identifier: Apache-2.0
+//
+// Open Component of the Helios Avionics Middleware (see LICENSING.md).
+// Licensed under the Apache License, Version 2.0 (see LICENSE).
+
 /**
  * @file    main.cpp
  * @brief   Helios UAV — Flight Controller Firmware Core

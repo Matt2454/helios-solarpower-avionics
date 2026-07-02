@@ -1,3 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Helios Avionics. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-Helios-Commercial
+#
+# PROPRIETARY AND CONFIDENTIAL — Core Component of the Helios Avionics
+# Middleware (see LICENSING.md). Licensed, not sold, under LICENSE-CORE.
+# Internal integration/validation harness that exercises the proprietary core.
 """
 Helios UAV Avionics — Flight Loop Simulator
 ============================================
