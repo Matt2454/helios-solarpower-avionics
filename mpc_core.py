@@ -76,6 +76,25 @@ _FEASIBLE_EPS: float = 1e-9
 # already robust, not merely nominal.
 DEFAULT_T_MIN_MARGIN: float = 1.5
 
+# ── Energy-awareness (State-of-Charge) ─────────────────────────────────
+# When the pack drains past SOC_CRITICAL, the controller shifts priority from
+# flight performance to thermal health, ramping to full priority at SOC_RESERVE.
+# Rationale: a cold, low-SoC Li-ion cell is the danger zone — reduced usable
+# capacity, higher internal resistance, plating risk on load — so a nearly-empty
+# pack is exactly when a thermal excursion is least survivable and least
+# affordable.
+SOC_CRITICAL: float = 0.20   # below this, energy-aware reweighting begins
+SOC_RESERVE:  float = 0.05   # thermal-priority urgency saturates (= 1.0) here
+
+# Battery thermal-comfort target: the mid-band temperature the controller is
+# nudged toward once energy-critical. Deviation from it is the soft "thermal
+# load" that gets priced in under low SoC (zero weight at healthy SoC, so
+# nominal flights are unaffected).
+T_COMFORT: float = (T_MIN_SAFE + T_MAX_SAFE) / 2.0   # 27.5 °C
+W_COMFORT: float = 0.5   # cost per K·step of comfort deviation, at full urgency.
+                         # PROVISIONAL — tune via the Monte-Carlo harness under
+                         # SoC scenarios before trusting in production.
+
 
 class TriggerReason(IntEnum):
     """
@@ -105,6 +124,7 @@ class MPCDecision:
         horizon_altitudes: list[float],
         cold_risk_at_min:  int | None,
         hot_risk_at_min:   int | None,
+        soc_urgency:       float = 0.0,
     ):
         self.vent_command      = vent_command       # float [0.0 – 1.0]
         self.trigger_reason    = trigger_reason     # human-readable label
@@ -115,12 +135,19 @@ class MPCDecision:
         self.horizon_altitudes = horizon_altitudes  # altitudes in the window
         self.cold_risk_at_min  = cold_risk_at_min   # first step at risk (cold)
         self.hot_risk_at_min   = hot_risk_at_min    # first step at risk (hot)
+        self.soc_urgency       = soc_urgency        # energy-priority factor [0–1]
+
+    @property
+    def energy_priority(self) -> bool:
+        """True when low SoC has shifted priority toward thermal health."""
+        return self.soc_urgency > 0.0
 
     def __repr__(self) -> str:
         return (
             f"MPCDecision(vent={self.vent_command:.1f}, "
             f"code={self.trigger_code.name}, "
             f"feasible={self.feasible}, cost={self.cost:.3f}, "
+            f"soc_urgency={self.soc_urgency:.2f}, "
             f"cold_risk_min={self.cold_risk_at_min}, "
             f"hot_risk_min={self.hot_risk_at_min})"
         )
@@ -172,6 +199,7 @@ class ModelPredictiveController:
         base_simulator: ThermalSimulator,
         t_min_margin:   float = DEFAULT_T_MIN_MARGIN,
         t_max_margin:   float = 0.0,
+        soc_critical:   float = SOC_CRITICAL,
     ):
         self.oracle   = weather_oracle
         self.sim_live = base_simulator   # the "real" simulator — never mutated here
@@ -182,6 +210,10 @@ class ModelPredictiveController:
         self.t_max_margin = t_max_margin
         self.t_min_eff    = T_MIN_SAFE + t_min_margin
         self.t_max_eff    = T_MAX_SAFE - t_max_margin
+
+        # Energy-awareness: SoC threshold below which thermal health is
+        # prioritised over flight performance (see _soc_urgency).
+        self.soc_critical = soc_critical
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -240,21 +272,43 @@ class ModelPredictiveController:
                 return i + 1
         return None
 
+    def _soc_urgency(self, battery_soc: float) -> float:
+        """
+        Energy-awareness ramp. Returns 0.0 while the pack is healthy
+        (SoC ≥ soc_critical) and rises linearly to 1.0 at SOC_RESERVE, where
+        thermal health takes absolute priority over flight performance.
+
+        At 0.0 the cost is identical to the nominal controller, so healthy-SoC
+        behaviour — and its 10k-trial validation — is preserved bit-for-bit.
+        """
+        if battery_soc >= self.soc_critical:
+            return 0.0
+        span = max(1e-6, self.soc_critical - SOC_RESERVE)
+        return max(0.0, min(1.0, (self.soc_critical - battery_soc) / span))
+
     def _trajectory_cost(
         self,
         temps:         list[float],
         vent_position: float,
+        soc_urgency:   float = 0.0,
     ) -> tuple[float, float]:
         """
         Score one candidate trajectory against the receding-horizon objective.
 
-            J = W_SAFETY · Σ band_violation(T_k)  +  W_EFFORT · effort(vent)
+            J = W_SAFETY  · Σ band_violation(T_k)                (hard safety)
+              + W_EFFORT  · (1 − u) · effort(vent)               (flight perf.)
+              + W_COMFORT · u       · Σ |T_k − T_COMFORT|        (thermal load)
 
-        band_violation is the per-step distance OUTSIDE the TIGHTENED band
-        [t_min_eff, t_max_eff] (0 while in-band), summed over the whole horizon.
-        Using the tightened band — not the raw certified limits — is what turns
-        this into a *robust* MPC: the controller is penalised for merely
-        approaching the limits, leaving a buffer to absorb model mismatch.
+        where u = soc_urgency ∈ [0, 1] is the energy-awareness factor.
+
+        * The hard safety term is unchanged and always dominant: a predicted
+          breach of the tightened band [t_min_eff, t_max_eff] outranks all else.
+        * The flight-performance (effort) term FADES OUT as the pack drains
+          (u → 1), so a low battery stops paying to save vent drag.
+        * The soft thermal-LOAD term is PRICED IN only as the pack drains,
+          pulling the predicted trajectory toward the comfort target T_COMFORT
+          (keeping a scarce battery near its thermal optimum). At healthy SoC
+          (u = 0) it is exactly zero, leaving nominal behaviour untouched.
 
         Returns
         -------
@@ -263,14 +317,22 @@ class ModelPredictiveController:
             total_violation : summed band violation [K·steps]; 0.0 ⇒ feasible
         """
         total_violation = 0.0
+        thermal_load    = 0.0
         for t in temps:
             if t < self.t_min_eff:
                 total_violation += (self.t_min_eff - t)
             elif t > self.t_max_eff:
                 total_violation += (t - self.t_max_eff)
+            # Soft "thermal load" — distance from the comfort target. Computed
+            # always, but only PRICED when soc_urgency > 0 (see cost below).
+            thermal_load += abs(t - T_COMFORT)
 
         effort = VENT_EFFORT[vent_position]
-        cost   = W_SAFETY * total_violation + W_EFFORT * effort
+        cost = (
+            W_SAFETY  * total_violation
+            + W_EFFORT  * (1.0 - soc_urgency) * effort
+            + W_COMFORT * soc_urgency         * thermal_load
+        )
         return cost, total_violation
 
     # ------------------------------------------------------------------
@@ -283,6 +345,7 @@ class ModelPredictiveController:
         flight_plan:          list[float],
         current_current_motor: float,
         current_current_solar: float,
+        battery_soc:          float = 1.0,
     ) -> MPCDecision:
         """
         Core MPC planning cycle — receding-horizon cost minimisation.
@@ -311,13 +374,21 @@ class ModelPredictiveController:
         flight_plan            : list of altitudes [m] for the next N minutes
         current_current_motor  : motor draw right now [A]
         current_current_solar  : solar charge right now [A]
+        battery_soc            : pack state of charge [0.0–1.0]. Below
+                                 soc_critical the cost shifts priority toward
+                                 thermal health (see _soc_urgency). Defaults to
+                                 1.0 (full) ⇒ identical to nominal behaviour.
 
         Returns
         -------
         MPCDecision with vent command, wire-ready trigger code, feasibility,
-        objective cost and full diagnostic data.
+        objective cost, energy-priority factor and full diagnostic data.
         """
         candidates = (VENT_CLOSED, VENT_CRUISE, VENT_OPEN)
+
+        # Energy-awareness: a low pack raises this toward 1.0, fading out flight
+        # performance and pricing in thermal comfort inside _trajectory_cost.
+        soc_urgency = self._soc_urgency(battery_soc)
 
         # ── 1. Roll and score every candidate over the full horizon ────────
         trajectories: dict[float, list[float]] = {}
@@ -329,7 +400,7 @@ class ModelPredictiveController:
                 current_current_motor, current_current_solar,
                 v,
             )
-            cost, violation = self._trajectory_cost(temps, v)
+            cost, violation = self._trajectory_cost(temps, v, soc_urgency)
             trajectories[v] = temps
             costs[v]        = cost
             violations[v]   = violation
@@ -372,6 +443,10 @@ class ModelPredictiveController:
             code   = TriggerReason.CRUISE_NOMINAL
             reason = "CRUISE — battery temperature within safe window"
 
+        # Annotate when energy-awareness is actively shaping the decision.
+        if soc_urgency > 0.0:
+            reason += f"  [ENERGY-PRIORITY urgency={soc_urgency:.2f}]"
+
         return MPCDecision(
             vent_command      = best_vent,
             trigger_reason    = reason,
@@ -382,6 +457,7 @@ class ModelPredictiveController:
             horizon_altitudes = list(flight_plan),
             cold_risk_at_min  = cold_risk,
             hot_risk_at_min   = hot_risk,
+            soc_urgency       = soc_urgency,
         )
 
 
