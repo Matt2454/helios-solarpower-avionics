@@ -28,15 +28,20 @@ protected algorithm.
 |------|------|
 | `main.cpp` | SITL / host reference port of the flight-loop harness, incl. the (non-novel) attitude PID reference controller |
 | `weather_oracle.py` | ISA atmospheric model — standard, published physics |
+| `solar_model.py` | Clear-sky solar geometry model — standard, published physics |
+| `hal/helios_hal.h` | Hardware Abstraction Layer interfaces (`ITemperatureSensor`, `IVentActuator`) — the porting surface |
 
 ### Core Components — Proprietary (`LICENSE-CORE`)
 The moat. Source is confidential; shipped to OEMs as a precompiled library only.
 
 | File | Role |
 |------|------|
-| `mpc_core.py` | Model Predictive Control engine — the pre-emptive thermal-vent algorithm |
+| `mpc_core.py` | Model Predictive Control engine — the pre-emptive thermal-vent algorithm (reference model) |
 | `thermal_simulator.py` | Reference thermal plant model used by the MPC rollout |
 | `flight_loop_sim.py` | Internal integration/validation harness that exercises the proprietary core |
+| `validation_montecarlo.py` | Monte-Carlo robustness / certification harness and its methodology |
+| `core/helios_core.h` | Zero-allocation C++ port target of the MPC engine |
+| `core/safety_monitor.h` | L2 Safety Monitor (run-time assurance) with override authority |
 
 ## SPDX conventions
 
