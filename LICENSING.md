@@ -40,6 +40,7 @@ The moat. Source is confidential; shipped to OEMs as a precompiled library only.
 | `thermal_simulator.py` | Reference thermal plant model used by the MPC rollout |
 | `flight_loop_sim.py` | Internal integration/validation harness that exercises the proprietary core |
 | `validation_montecarlo.py` | Monte-Carlo robustness / certification harness and its methodology |
+| `validation_soc_stress.py` | SoC / fault-injection stress harness (layered MPC + Safety Monitor) |
 | `core/helios_core.h` | Zero-allocation C++ port target of the MPC engine |
 | `core/safety_monitor.h` | L2 Safety Monitor (run-time assurance) with override authority |
 

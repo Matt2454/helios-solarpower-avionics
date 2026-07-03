@@ -65,7 +65,14 @@ struct Config {
     float    t_min_hard_c    = 10.0f;
     float    t_max_hard_c    = 45.0f;
 
-    float    vent_failsafe   = 0.2f;   // posture when we cannot do better
+    float    vent_failsafe   = 0.2f;   // blind posture when nothing is known
+    // Temperature-conditioned failsafe bounds (validation finding S2: a STATIC
+    // failsafe posture during a sensor blackout actively cooled a cold-marginal
+    // pack and caused the breach it should prevent — see
+    // validation_soc_stress.py). Below/above these, the blind posture becomes
+    // CLOSE (retain heat) / OPEN (dump heat) based on the last good sample.
+    float    failsafe_cold_below_c = 20.0f;
+    float    failsafe_hot_above_c  = 40.0f;
     float    slew_per_step   = 0.25f;  // max |Δcmd| per step() call
     uint8_t  sensor_debounce = 3;      // consecutive bad samples → PERSIST fault
     uint32_t mpc_timeout_ms  = 10000;  // advisory staleness bound; set to
@@ -114,10 +121,13 @@ public:
 
         // ── 2. Untrustworthy input → failsafe posture ───────────────────────
         // Without a believable temperature the envelope cannot be verified, so
-        // neither the MPC's advisory nor a reactive response is justified.
+        // neither the MPC's advisory nor a reactive response is justified. The
+        // posture is CONDITIONED on the last good sample, never static: a
+        // static posture was shown (harness scenario S2) to actively cool a
+        // cold-marginal pack during the blackout and cause the breach itself.
         if (!trustworthy) {
             faults |= FAULT_SENSOR_PERSIST;
-            out.vent_cmd = slewTo(cfg_.vent_failsafe);
+            out.vent_cmd = slewTo(failsafePosture());
             out.verdict  = Verdict::OVERRIDE_FAILSAFE;
             out.faults   = faults;
             return out;
@@ -146,7 +156,7 @@ public:
             !mpc.ever_received || (now_ms - mpc.timestamp_ms) > cfg_.mpc_timeout_ms;
         if (stale) {
             faults |= FAULT_MPC_STALE;
-            out.vent_cmd = slewTo(cfg_.vent_failsafe);
+            out.vent_cmd = slewTo(failsafePosture());
             out.verdict  = Verdict::OVERRIDE_FAILSAFE;
             out.faults   = faults;
             return out;
@@ -169,6 +179,17 @@ public:
     }
 
 private:
+    /// Blind-mode posture, conditioned on the last trustworthy temperature.
+    /// Cold half of the band → close (retain heat); hot region → open (dump
+    /// heat); otherwise the neutral cruise posture. If no sample was ever
+    /// good, fall back to the configured neutral posture.
+    float failsafePosture() const {
+        if (!have_temp_) return cfg_.vent_failsafe;
+        if (last_good_temp_ < cfg_.failsafe_cold_below_c) return 0.0f;
+        if (last_good_temp_ > cfg_.failsafe_hot_above_c)  return 1.0f;
+        return cfg_.vent_failsafe;
+    }
+
     /// Rate-limit command motion so a single cycle can never slam the servo
     /// full-travel (one bad frame ≠ one mechanical shock). First call jumps
     /// directly to the target (no prior position to slew from).

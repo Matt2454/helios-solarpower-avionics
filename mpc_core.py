@@ -103,6 +103,13 @@ W_COMFORT: float = 0.5   # cost per K·step of comfort deviation, at full urgenc
 # the edge.
 SOC_MARGIN_BOOST: float = 1.0   # K at urgency 1.0 — PROVISIONAL, tune with harness
 
+# Mode hysteresis: energy-aware mode LATCHES on below soc_critical and releases
+# only above soc_critical + SOC_HYSTERESIS. Prevents SoC sensor noise dithering
+# around the 20% threshold from flapping the mode flag (GCS chatter) and the
+# active floor. The urgency RAMP is already continuous at the threshold, so the
+# weights cannot jump — the latch stabilises the discrete mode signal.
+SOC_HYSTERESIS: float = 0.02
+
 
 class TriggerReason(IntEnum):
     """
@@ -224,6 +231,13 @@ class ModelPredictiveController:
         # Energy-awareness: SoC threshold below which thermal health is
         # prioritised over flight performance (see _soc_urgency).
         self.soc_critical = soc_critical
+        self.soc_exit     = soc_critical + SOC_HYSTERESIS
+
+        # Hysteresis latch — the ONLY piece of persistent state in the
+        # controller (one bit, deliberate). The core is still deterministic:
+        # (state, inputs) → output. C++ port: one bool member. Reset by
+        # constructing a fresh controller.
+        self._energy_mode_latched = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -284,14 +298,30 @@ class ModelPredictiveController:
 
     def _soc_urgency(self, battery_soc: float) -> float:
         """
-        Energy-awareness ramp. Returns 0.0 while the pack is healthy
-        (SoC ≥ soc_critical) and rises linearly to 1.0 at SOC_RESERVE, where
-        thermal health takes absolute priority over flight performance.
+        Energy-awareness ramp with mode hysteresis.
 
-        At 0.0 the cost is identical to the nominal controller, so healthy-SoC
-        behaviour — and its 10k-trial validation — is preserved bit-for-bit.
+        Mode entry:  SoC < soc_critical            → latch energy-aware mode ON
+        Mode exit :  SoC ≥ soc_critical + 2% band  → release the latch
+
+        While latched, urgency rises linearly from 0.0 (at soc_critical) to 1.0
+        at SOC_RESERVE, where thermal health takes absolute priority over
+        flight performance. While unlatched, urgency is exactly 0.0 and the
+        cost is identical to the nominal controller — healthy-SoC behaviour,
+        and its 10k-trial certification, is preserved bit-for-bit.
+
+        The hysteresis band prevents SoC measurement noise around the 20%
+        threshold from flapping the mode flag and the active floor
+        ("chattering"). The ramp itself is continuous at the threshold, so
+        weights never jump on entry/exit.
         """
-        if battery_soc >= self.soc_critical:
+        if self._energy_mode_latched:
+            if battery_soc >= self.soc_exit:
+                self._energy_mode_latched = False
+        else:
+            if battery_soc < self.soc_critical:
+                self._energy_mode_latched = True
+
+        if not self._energy_mode_latched:
             return 0.0
         span = max(1e-6, self.soc_critical - SOC_RESERVE)
         return max(0.0, min(1.0, (self.soc_critical - battery_soc) / span))
