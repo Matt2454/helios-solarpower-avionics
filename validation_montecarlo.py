@@ -73,6 +73,10 @@ START_TEMP_NOMINAL: float = 22.0   # °C — take-off battery temp the MPC assum
 # ── Margin sweep grid (cold-side robustness back-off, Kelvin) ───────────
 MARGIN_SWEEP = [round(0.5 * i, 1) for i in range(9)]   # 0.0 … 4.0 K, step 0.5
 
+# ── Certified-buffer confirmation run ───────────────────────────────────
+DEFAULT_MARGIN: float = 1.5      # candidate Certified Safety Buffer to confirm
+CONFIRM_TRIALS: int   = 10_000   # large sample → tight statistical confidence
+
 
 @dataclass
 class MismatchConfig:
@@ -316,5 +320,63 @@ def run_sweep(cfg: MismatchConfig, margins: list[float]) -> None:
     print()
 
 
+def _upper95_one_sided_zero(n: int) -> float:
+    """
+    Exact one-sided 95% upper confidence bound on an event rate when ZERO events
+    are observed in n trials (Clopper-Pearson): p_hi = 1 − 0.05**(1/n).
+    Approximates the "rule of three" (≈ 3/n) but is exact.
+    """
+    return 1.0 - 0.05 ** (1.0 / n)
+
+
+def run_confirmation(
+    cfg: MismatchConfig,
+    mission,
+    margin: float,
+    n_trials: int,
+) -> None:
+    """
+    Large-sample confirmation at a single margin, on a population INDEPENDENT of
+    the sweep (seed offset), so the buffer is validated on data it was not tuned
+    against. Reports outcome rates and exact 95% confidence bounds.
+    """
+    rng = random.Random(cfg.seed + 1)   # independent of the tuning sweep
+    results = [run_trial(rng, cfg, mission, margin) for _ in range(n_trials)]
+    n = len(results)
+
+    safe     = sum(r.outcome == "SAFE"   for r in results)
+    warned   = sum(r.outcome == "WARNED" for r in results)
+    silent   = sum(r.outcome == "SILENT" for r in results)
+    breaches = warned + silent
+    margins  = sorted(r.realized_margin for r in results)
+
+    DIV = "═" * 82
+    print()
+    print(f"  CONFIRMATION — t_min_margin = {margin:.1f} K · {n:,} INDEPENDENT trials "
+          f"(seed {cfg.seed + 1})")
+    print(DIV)
+    print(f"    SAFE    : {safe:>6,d}  ({100.0*safe/n:7.3f}%)")
+    print(f"    WARNED  : {warned:>6,d}  ({100.0*warned/n:7.3f}%)")
+    print(f"    SILENT  : {silent:>6,d}  ({100.0*silent/n:7.3f}%)")
+    print(f"    Worst realized margin : {margins[0]:+.2f} K vs T_MIN")
+    print(f"    5th-pctile margin     : {_pctile(margins, 0.05):+.2f} K")
+    print("  " + "─" * 80)
+    if silent == 0:
+        print(f"    SILENT rate : 0 / {n:,} observed → < {100.0*_upper95_one_sided_zero(n):.3f}%"
+              f"  (95% one-sided CI)")
+    else:
+        print(f"    SILENT rate : {100.0*silent/n:.3f}% observed")
+    if breaches == 0:
+        print(f"    ANY breach  : 0 / {n:,} observed → < {100.0*_upper95_one_sided_zero(n):.3f}%"
+              f"  (95% one-sided CI)")
+    else:
+        print(f"    ANY breach  : {100.0*breaches/n:.3f}% observed")
+    print(DIV)
+    print()
+
+
 if __name__ == "__main__":
-    run_sweep(MismatchConfig(), MARGIN_SWEEP)
+    _cfg     = MismatchConfig()
+    _mission = generate_mission_profile()
+    run_sweep(_cfg, MARGIN_SWEEP)
+    run_confirmation(_cfg, _mission, DEFAULT_MARGIN, CONFIRM_TRIALS)

@@ -76,6 +76,7 @@ class ThermalSimulator:
         self.last_P_joule      = 0.0
         self.last_P_conduction = 0.0
         self.last_P_convection = 0.0
+        self.last_P_solar      = 0.0
         self.last_P_total      = 0.0
         self.last_dT           = 0.0
 
@@ -135,6 +136,7 @@ class ThermalSimulator:
         corrente_solare: float,
         v_pitot: float,
         posizione_botola: float,
+        p_solar_ext: float = 0.0,
     ) -> float:
         """
         Advance the thermal state by one time step (60 s).
@@ -146,6 +148,10 @@ class ThermalSimulator:
         corrente_solare  : Solar panel charge current        [A]
         v_pitot          : Airspeed measured by Pitot tube   [m/s]
         posizione_botola : Servo vent opening, 0.0–1.0       [-]
+        p_solar_ext      : Direct radiative solar heating of the enclosure [W].
+                           Default 0.0 (no insolation). Supplied by SolarModel
+                           in flight; distinct from the ELECTRICAL solar path,
+                           which enters via corrente_solare → Joule heating.
 
         Returns
         -------
@@ -154,8 +160,9 @@ class ThermalSimulator:
         P_joule      = self._joule_heating(corrente_motore, corrente_solare)
         P_conduction = self._conduction(temp_esterna)
         P_convection = self._convection(temp_esterna, v_pitot, posizione_botola)
+        P_solar      = max(0.0, p_solar_ext)   # radiative gain is one-directional
 
-        P_total = P_joule + P_conduction + P_convection
+        P_total = P_joule + P_conduction + P_convection + P_solar
         dT      = (P_total * self.DT) / self.C_thermal
 
         self.T_internal += dT
@@ -164,6 +171,7 @@ class ThermalSimulator:
         self.last_P_joule      = P_joule
         self.last_P_conduction = P_conduction
         self.last_P_convection = P_convection
+        self.last_P_solar      = P_solar
         self.last_P_total      = P_total
         self.last_dT           = dT
 
