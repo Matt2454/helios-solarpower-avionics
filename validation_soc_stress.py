@@ -73,6 +73,7 @@ F_SENSOR_INVALID, F_SENSOR_PERSIST = 1 << 0, 1 << 1
 F_MPC_STALE                        = 1 << 2
 F_ENV_COLD, F_ENV_HOT              = 1 << 3, 1 << 4
 F_CMD_RANGE, F_CMD_SLEW            = 1 << 5, 1 << 6
+F_ACTUATOR_STALL                   = 1 << 7
 
 
 class SafetyMonitorRef:
@@ -83,17 +84,21 @@ class SafetyMonitorRef:
 
     def __init__(self, t_min_hard=10.0, t_max_hard=45.0,
                  vent_failsafe=0.2, slew_per_step=0.25, sensor_debounce=3,
-                 failsafe_cold_below=20.0, failsafe_hot_above=40.0):
+                 failsafe_cold_below=20.0, failsafe_hot_above=40.0,
+                 stall_tol=0.15, stall_debounce=3):
         self.t_min_hard, self.t_max_hard = t_min_hard, t_max_hard
         self.vent_failsafe       = vent_failsafe
         self.slew_per_step       = slew_per_step
         self.sensor_debounce     = sensor_debounce
         self.failsafe_cold_below = failsafe_cold_below
         self.failsafe_hot_above  = failsafe_hot_above
-        self._last_cmd   = -1.0
-        self._last_good  = 0.0
-        self._have_temp  = False
-        self._bad_streak = 0
+        self.stall_tol           = stall_tol
+        self.stall_debounce      = stall_debounce
+        self._last_cmd     = -1.0
+        self._last_good    = 0.0
+        self._have_temp    = False
+        self._bad_streak   = 0
+        self._stall_streak = 0
 
     def _failsafe_posture(self) -> float:
         """Temperature-CONDITIONED failsafe. Forensic finding (S2, first run):
@@ -119,8 +124,17 @@ class SafetyMonitorRef:
         self._last_cmd = v
         return v
 
-    def step(self, t_meas: float, sample_ok: bool, adv_vent: float):
-        faults = 0
+    def step(self, t_meas: float, sample_ok: bool, adv_vent: float,
+             vent_actual: float = -1.0):
+        # Actuator-stall detection: did last cycle's command take effect?
+        # Reported on every path below (escalation, not mitigation).
+        if self._last_cmd >= 0.0 and vent_actual >= 0.0:
+            if abs(vent_actual - self._last_cmd) > self.stall_tol:
+                self._stall_streak = min(255, self._stall_streak + 1)
+            else:
+                self._stall_streak = 0
+        faults = F_ACTUATOR_STALL if self._stall_streak >= self.stall_debounce else 0
+
         if sample_ok:
             self._bad_streak = 0
             self._last_good  = t_meas
@@ -233,6 +247,7 @@ class TrialOutcome:
     n_failsafe:        int
     cruise_frac:       float
     failsafe_latency:  list       # ticks, per stale-window onset
+    stall_latency:     int | None # ticks from stall onset to STALL fault raised
     diverged:          bool
     blackbox_on_fail:  list       # frozen ring at first breach (else empty)
 
@@ -272,6 +287,8 @@ class SoCStressTester:
         n_react = n_fs = n_cruise = 0
         bb_frozen: list = []
         fs_seen_after: dict[int, int | None] = {s: None for s, _ in f.stale_windows}
+        stall_start    = f.stall_window[0] if f.stall_window else None
+        stall_detected = None
 
         for mm in self.mission:
             k = mm.minute
@@ -303,7 +320,17 @@ class SoCStressTester:
                 warned = True
 
             # ── L2: Safety Monitor ───────────────────────────────────
-            cmd, verdict, faults = mon.step(t_meas, not stale, dec.vent_command)
+            # vent_actual here still holds LAST cycle's achieved position —
+            # exactly the feedback the monitor needs for stall detection.
+            cmd, verdict, faults = mon.step(
+                t_meas, not stale, dec.vent_command, vent_actual)
+            if faults & F_ACTUATOR_STALL:
+                # A raised stall fault is an escalation to the autopilot, so a
+                # subsequent breach is NOT silent — the system said so.
+                if not breached:
+                    warned = True
+                if stall_start is not None and stall_detected is None and k >= stall_start:
+                    stall_detected = k - stall_start
             if verdict == V_OVR_REACTIVE:
                 n_react += 1
                 if not breached:
@@ -355,7 +382,8 @@ class SoCStressTester:
         lat = [v for v in fs_seen_after.values() if v is not None]
         n_steps = max(1, len(self.mission))
         return TrialOutcome(breached, warned, min_t, min_soc, n_react, n_fs,
-                            n_cruise / n_steps, lat, diverged, bb_frozen)
+                            n_cruise / n_steps, lat, stall_detected, diverged,
+                            bb_frozen)
 
     def run_campaign(self, n_trials: int, seed: int) -> dict:
         rng = random.Random(seed)
@@ -363,6 +391,7 @@ class SoCStressTester:
         breaches = [o for o in outs if o.breached]
         silent   = [o for o in breaches if not o.warned]
         lat      = [v for o in outs for v in o.failsafe_latency]
+        stall_lat = [o.stall_latency for o in outs if o.stall_latency is not None]
         return {
             "n": n_trials,
             "breach":  len(breaches),
@@ -374,6 +403,8 @@ class SoCStressTester:
             "min_t":   min(o.min_true_t for o in outs),
             "min_soc": min(o.min_soc for o in outs),
             "lat_max": max(lat) if lat else None,
+            "stall_lat_max": max(stall_lat) if stall_lat else None,
+            "stall_detect_rate": (len(stall_lat) / n_trials) if stall_lat else 0.0,
             "diverged": sum(o.diverged for o in outs),
             "bb": next((o.blackbox_on_fail for o in outs if o.blackbox_on_fail), []),
         }
@@ -443,6 +474,14 @@ def main() -> None:
     for name, n, fc in scenarios:
         results[name] = SoCStressTester(cfg, fc).run_campaign(n, seed)
         print(_row(name, results[name]))
+    print(DIV)
+
+    # Actuator-stall detection (S3): escalation latency + coverage.
+    s3 = results["S3 vent STALLED open, dusk"]
+    if s3["stall_lat_max"] is not None:
+        print(f"  S3 actuator-stall: detected in {100*s3['stall_detect_rate']:.0f}% of "
+              f"trials, worst latency {s3['stall_lat_max']} ticks (= stall_debounce). "
+              f"Escalation only — a jammed single vent is not software-recoverable.")
     print(DIV)
 
     # ── Sensitivity matrix: W_COMFORT × SOC_MARGIN_BOOST ───────────────

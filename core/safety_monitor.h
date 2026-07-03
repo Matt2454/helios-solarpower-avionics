@@ -49,6 +49,7 @@ enum FaultBits : uint16_t {
     FAULT_ENVELOPE_HOT     = 1u << 4,  // measured T at/above hard hot ceiling
     FAULT_CMD_OUT_OF_RANGE = 1u << 5,  // advisory outside [0,1]; clamped
     FAULT_CMD_SLEW_LIMITED = 1u << 6,  // advisory shaped by the slew limiter
+    FAULT_ACTUATOR_STALL   = 1u << 7,  // commanded vent not achieved (jam/fault)
 };
 
 enum class Verdict : uint8_t {
@@ -75,6 +76,8 @@ struct Config {
     float    failsafe_hot_above_c  = 40.0f;
     float    slew_per_step   = 0.25f;  // max |Δcmd| per step() call
     uint8_t  sensor_debounce = 3;      // consecutive bad samples → PERSIST fault
+    float    stall_tol       = 0.15f;  // |actual − commanded| beyond this = stuck
+    uint8_t  stall_debounce  = 3;      // consecutive stuck cycles → STALL fault
     uint32_t mpc_timeout_ms  = 10000;  // advisory staleness bound; set to
                                        // 3–5× the advisory period per integration
 };
@@ -98,11 +101,36 @@ public:
 
     /// One monitor cycle. Call every control tick, AFTER reading the sensor and
     /// BEFORE writing the actuator:   sensor → MPC (advisory) → step() → HAL.
+    ///
+    /// @param vent_actual  actuator position feedback from
+    ///   IVentActuator::actualPosition() (this cycle's reading reflects LAST
+    ///   cycle's command). Pass a negative value if the actuator has no
+    ///   feedback — stall detection is then skipped, not falsely tripped.
+    ///
+    /// A confirmed FAULT_ACTUATOR_STALL is ESCALATION, not mitigation: a jammed
+    /// single vent cannot be corrected in software. The bit tells the autopilot
+    /// that thermal authority is degraded so it can take a FLIGHT action (e.g.
+    /// descend to warmer air). The monitor still issues its best command.
     Output step(const hal::TemperatureReading& temp,
                 const Advisory&                mpc,
+                float                          vent_actual,
                 uint32_t                       now_ms) {
         Output out{};
-        uint16_t faults = FAULT_NONE;
+
+        // ── 0. Actuator-stall detection ────────────────────────────────────
+        // Did LAST cycle's command actually take effect? Compare the feedback
+        // against the command we issued. Debounced so a servo mid-travel is not
+        // mistaken for a jam. Detected here (top) so the bit is reported on
+        // EVERY return path, including the overrides below.
+        if (last_cmd_ >= 0.0f && vent_actual >= 0.0f) {
+            const float e  = vent_actual - last_cmd_;
+            const float ae = (e < 0.0f) ? -e : e;
+            if (ae > cfg_.stall_tol) { if (stall_streak_ < 0xFF) ++stall_streak_; }
+            else                     { stall_streak_ = 0; }
+        }
+        uint16_t faults =
+            (stall_streak_ >= cfg_.stall_debounce) ? FAULT_ACTUATOR_STALL
+                                                   : FAULT_NONE;
 
         // ── 1. Sensor validation filter (STALE / OUT_OF_RANGE / FAULT) ─────
         const bool sample_ok = temp.valid();
@@ -207,6 +235,7 @@ private:
     float   last_good_temp_ = 0.0f;
     bool    have_temp_      = false;
     uint8_t bad_streak_     = 0;
+    uint8_t stall_streak_   = 0;      // consecutive cycles command ≠ feedback
 };
 
 } // namespace helios::safety
