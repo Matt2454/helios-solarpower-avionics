@@ -95,6 +95,21 @@ W_COMFORT: float = 0.5   # cost per K·step of comfort deviation, at full urgenc
                          # PROVISIONAL — tune via the Monte-Carlo harness under
                          # SoC scenarios before trusting in production.
 
+# Conservative-safety margin boost: at full urgency the enforced cold floor is
+# additionally WIDENED by this many Kelvin on top of the certified 1.5 K buffer
+# (constraint tightening that tightens further as energy runs out). Side effect
+# by design: a widened floor makes BEST_EFFORT_INFEASIBLE fire earlier, so a
+# low battery asks the autopilot for help sooner instead of flying closer to
+# the edge.
+SOC_MARGIN_BOOST: float = 1.0   # K at urgency 1.0 — PROVISIONAL, tune with harness
+
+# Mode hysteresis: energy-aware mode LATCHES on below soc_critical and releases
+# only above soc_critical + SOC_HYSTERESIS. Prevents SoC sensor noise dithering
+# around the 20% threshold from flapping the mode flag (GCS chatter) and the
+# active floor. The urgency RAMP is already continuous at the threshold, so the
+# weights cannot jump — the latch stabilises the discrete mode signal.
+SOC_HYSTERESIS: float = 0.02
+
 
 class TriggerReason(IntEnum):
     """
@@ -125,6 +140,7 @@ class MPCDecision:
         cold_risk_at_min:  int | None,
         hot_risk_at_min:   int | None,
         soc_urgency:       float = 0.0,
+        t_min_eff_active:  float = 0.0,
     ):
         self.vent_command      = vent_command       # float [0.0 – 1.0]
         self.trigger_reason    = trigger_reason     # human-readable label
@@ -136,6 +152,7 @@ class MPCDecision:
         self.cold_risk_at_min  = cold_risk_at_min   # first step at risk (cold)
         self.hot_risk_at_min   = hot_risk_at_min    # first step at risk (hot)
         self.soc_urgency       = soc_urgency        # energy-priority factor [0–1]
+        self.t_min_eff_active  = t_min_eff_active   # cold floor enforced this cycle [°C]
 
     @property
     def energy_priority(self) -> bool:
@@ -214,6 +231,13 @@ class ModelPredictiveController:
         # Energy-awareness: SoC threshold below which thermal health is
         # prioritised over flight performance (see _soc_urgency).
         self.soc_critical = soc_critical
+        self.soc_exit     = soc_critical + SOC_HYSTERESIS
+
+        # Hysteresis latch — the ONLY piece of persistent state in the
+        # controller (one bit, deliberate). The core is still deterministic:
+        # (state, inputs) → output. C++ port: one bool member. Reset by
+        # constructing a fresh controller.
+        self._energy_mode_latched = False
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -274,14 +298,30 @@ class ModelPredictiveController:
 
     def _soc_urgency(self, battery_soc: float) -> float:
         """
-        Energy-awareness ramp. Returns 0.0 while the pack is healthy
-        (SoC ≥ soc_critical) and rises linearly to 1.0 at SOC_RESERVE, where
-        thermal health takes absolute priority over flight performance.
+        Energy-awareness ramp with mode hysteresis.
 
-        At 0.0 the cost is identical to the nominal controller, so healthy-SoC
-        behaviour — and its 10k-trial validation — is preserved bit-for-bit.
+        Mode entry:  SoC < soc_critical            → latch energy-aware mode ON
+        Mode exit :  SoC ≥ soc_critical + 2% band  → release the latch
+
+        While latched, urgency rises linearly from 0.0 (at soc_critical) to 1.0
+        at SOC_RESERVE, where thermal health takes absolute priority over
+        flight performance. While unlatched, urgency is exactly 0.0 and the
+        cost is identical to the nominal controller — healthy-SoC behaviour,
+        and its 10k-trial certification, is preserved bit-for-bit.
+
+        The hysteresis band prevents SoC measurement noise around the 20%
+        threshold from flapping the mode flag and the active floor
+        ("chattering"). The ramp itself is continuous at the threshold, so
+        weights never jump on entry/exit.
         """
-        if battery_soc >= self.soc_critical:
+        if self._energy_mode_latched:
+            if battery_soc >= self.soc_exit:
+                self._energy_mode_latched = False
+        else:
+            if battery_soc < self.soc_critical:
+                self._energy_mode_latched = True
+
+        if not self._energy_mode_latched:
             return 0.0
         span = max(1e-6, self.soc_critical - SOC_RESERVE)
         return max(0.0, min(1.0, (self.soc_critical - battery_soc) / span))
@@ -291,6 +331,8 @@ class ModelPredictiveController:
         temps:         list[float],
         vent_position: float,
         soc_urgency:   float = 0.0,
+        t_min_eff:     float | None = None,
+        t_max_eff:     float | None = None,
     ) -> tuple[float, float]:
         """
         Score one candidate trajectory against the receding-horizon objective.
@@ -316,13 +358,20 @@ class ModelPredictiveController:
             cost            : full objective value (lower is better)
             total_violation : summed band violation [K·steps]; 0.0 ⇒ feasible
         """
+        # Active band for THIS cycle. Callers pass a widened floor when the
+        # energy-aware conservative mode is engaged; defaults reproduce the
+        # certified static band. Explicit arguments (not hidden state) keep this
+        # a pure function of its inputs — required for the deterministic C++ port.
+        floor   = self.t_min_eff if t_min_eff is None else t_min_eff
+        ceiling = self.t_max_eff if t_max_eff is None else t_max_eff
+
         total_violation = 0.0
         thermal_load    = 0.0
         for t in temps:
-            if t < self.t_min_eff:
-                total_violation += (self.t_min_eff - t)
-            elif t > self.t_max_eff:
-                total_violation += (t - self.t_max_eff)
+            if t < floor:
+                total_violation += (floor - t)
+            elif t > ceiling:
+                total_violation += (t - ceiling)
             # Soft "thermal load" — distance from the comfort target. Computed
             # always, but only PRICED when soc_urgency > 0 (see cost below).
             thermal_load += abs(t - T_COMFORT)
@@ -390,6 +439,11 @@ class ModelPredictiveController:
         # performance and pricing in thermal comfort inside _trajectory_cost.
         soc_urgency = self._soc_urgency(battery_soc)
 
+        # Conservative safety mode: low SoC WIDENS the enforced cold floor on
+        # top of the certified buffer — trading efficiency for cell integrity,
+        # and making infeasibility fire earlier when energy is scarce.
+        t_min_active = self.t_min_eff + SOC_MARGIN_BOOST * soc_urgency
+
         # ── 1. Roll and score every candidate over the full horizon ────────
         trajectories: dict[float, list[float]] = {}
         costs:        dict[float, float]        = {}
@@ -400,7 +454,9 @@ class ModelPredictiveController:
                 current_current_motor, current_current_solar,
                 v,
             )
-            cost, violation = self._trajectory_cost(temps, v, soc_urgency)
+            cost, violation = self._trajectory_cost(
+                temps, v, soc_urgency, t_min_eff=t_min_active,
+            )
             trajectories[v] = temps
             costs[v]        = cost
             violations[v]   = violation
@@ -409,7 +465,7 @@ class ModelPredictiveController:
         # These indices explain *why* an action is taken (what would happen if
         # we held nominal cruise); the action itself is chosen by optimisation.
         cruise_temps = trajectories[VENT_CRUISE]
-        cold_risk = self._first_breach(cruise_temps, self.t_min_eff, above=False)
+        cold_risk = self._first_breach(cruise_temps, t_min_active, above=False)
         hot_risk  = self._first_breach(cruise_temps, self.t_max_eff, above=True)
 
         # ── 3. Select the cost-minimising vent command ─────────────────────
@@ -428,9 +484,9 @@ class ModelPredictiveController:
         elif best_vent == VENT_CLOSED:
             code   = TriggerReason.PREEMPTIVE_CLOSE_COLD
             reason = (
-                f"PRE-EMPTIVE CLOSE — cruise would cross the effective floor "
-                f"({self.t_min_eff:.1f}°C = T_MIN+{self.t_min_margin:.1f}) at "
-                f"step {cold_risk}; closing keeps the horizon in-band"
+                f"PRE-EMPTIVE CLOSE — cruise would cross the active floor "
+                f"({t_min_active:.1f}°C = T_MIN+{t_min_active - T_MIN_SAFE:.1f}) "
+                f"at step {cold_risk}; closing keeps the horizon in-band"
             )
         elif best_vent == VENT_OPEN:
             code   = TriggerReason.PREEMPTIVE_OPEN_HOT
@@ -458,6 +514,7 @@ class ModelPredictiveController:
             cold_risk_at_min  = cold_risk,
             hot_risk_at_min   = hot_risk,
             soc_urgency       = soc_urgency,
+            t_min_eff_active  = t_min_active,
         )
 
 
